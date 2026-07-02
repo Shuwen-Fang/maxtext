@@ -194,6 +194,16 @@ def _default_for_sds(sds):
   return jax.jit(_make, out_shardings=sharding)()
 
 
+def _deep_merge(base, overlay):
+  """Recursively merges `overlay` into `base`, returning a new dict. Overlay wins on leaves."""
+  if not (isinstance(base, dict) and isinstance(overlay, dict)):
+    return overlay if overlay is not None else base
+  out = dict(base)
+  for k, v in overlay.items():
+    out[k] = _deep_merge(base.get(k), v) if k in base else v
+  return out
+
+
 def _populate_pure_dict_from_partial(abstract_pure, partial_concrete):
   """Fills `abstract_pure` with values from `partial_concrete` (by path), defaulting the rest.
 
@@ -214,6 +224,27 @@ def _populate_pure_dict_from_partial(abstract_pure, partial_concrete):
   return _default_for_sds(abstract_pure)
 
 
+def _restore_nnx_aux_state(step_dir, aux_abstract, checkpoint_storage_concurrent_gb, use_ocdbt, use_zarr3):
+  """Restores the separately-saved rngs/dropout state written next to `items`.
+
+  Returns the restored aux state, or None when the checkpoint has no `nnx_aux`
+  subdir (a Linen-trained checkpoint, or one saved before aux persistence).
+  """
+  aux_path = epath.Path(step_dir) / "nnx_aux"
+  if not aux_abstract or not aux_path.exists():
+    return None
+  ckptr = ocp.Checkpointer(
+      ocp.PyTreeCheckpointHandler(
+          restore_concurrent_gb=checkpoint_storage_concurrent_gb,
+          save_concurrent_gb=checkpoint_storage_concurrent_gb,
+          use_ocdbt=use_ocdbt,
+          use_zarr3=use_zarr3,
+      )
+  )
+  restore_args = ocp.checkpoint_utils.construct_restore_args(aux_abstract)
+  return ckptr.restore(aux_path, args=ocp.args.PyTreeRestore(item=aux_abstract, restore_args=restore_args))
+
+
 def _load_linen_checkpoint_into_nnx(
     path,
     abstract_nnx_state,
@@ -224,7 +255,8 @@ def _load_linen_checkpoint_into_nnx(
   """Restores a Linen-layout checkpoint into an NNX state (pure_nnx resume).
 
   Restores against a Linen-shape abstract, reshapes back via
-  `from_linen_checkpoint_dict`, then fills NNX-only rngs/dropout with defaults.
+  `from_linen_checkpoint_dict`, then restores the separately-saved rngs/dropout
+  state when present (falling back to deterministic defaults otherwise).
   """
   max_logging.log(f"Restoring Linen-layout checkpoint into NNX state at {path}")
   nnx_abstract_pure = abstract_nnx_state.to_pure_dict()
@@ -241,6 +273,13 @@ def _load_linen_checkpoint_into_nnx(
   restored = ocp.args.PyTreeRestore(item=linen_abstract, restore_args=restore_args, partial_restore=True)
   restored = ckptr.restore(epath.Path(path), args=restored)
   partial_nnx = train_state_nnx.from_linen_checkpoint_dict(restored)
+
+  aux_abstract = train_state_nnx.extract_rng_state(nnx_abstract_pure.get("model", {}))
+  aux = _restore_nnx_aux_state(
+      epath.Path(path).parent, aux_abstract, checkpoint_storage_concurrent_gb, use_ocdbt, use_zarr3
+  )
+  if aux:
+    partial_nnx = _deep_merge(partial_nnx, {"model": aux})
   return _populate_pure_dict_from_partial(nnx_abstract_pure, partial_nnx)
 
 
@@ -250,7 +289,11 @@ def _restore_emergency_linen_checkpoint_into_nnx(
     abstract_nnx_state,
     map_to_pspec,
 ):
-  """Restores an emergency Linen-layout checkpoint into an NNX state."""
+  """Restores an emergency Linen-layout checkpoint into an NNX state.
+
+  Emergency checkpoints don't carry the separate rngs/dropout `nnx_aux` item, so
+  those are refilled with deterministic defaults.
+  """
   max_logging.log(f"Restoring emergency Linen-layout checkpoint into NNX state at step {step}")
   nnx_abstract_pure = abstract_nnx_state.to_pure_dict()
   linen_abstract = train_state_nnx.to_linen_checkpoint_dict(nnx_abstract_pure)
@@ -417,8 +460,10 @@ def create_orbax_checkpoint_manager(
 
   max_logging.log(f"Creating checkpoint manager with ocdbt={use_ocdbt} and zarr3={use_zarr3}")
 
-  # Base configuration for all dataset types
-  item_names = ("items",)
+  # Base configuration for all dataset types.
+  # `nnx_aux` carries the NNX-only rngs/dropout state that pure_nnx runs persist
+  # alongside the Linen-layout `items` (empty/unused for Linen runs).
+  item_names = ("items", "nnx_aux")
   # we need to use ocdbt and zarr3 to control max file size in the checkpoint
   item_handlers = {
       "items": PyTreeCheckpointHandler(
@@ -426,7 +471,13 @@ def create_orbax_checkpoint_manager(
           save_concurrent_gb=checkpoint_storage_concurrent_gb,
           use_ocdbt=use_ocdbt,
           use_zarr3=use_zarr3,
-      )
+      ),
+      "nnx_aux": PyTreeCheckpointHandler(
+          restore_concurrent_gb=checkpoint_storage_concurrent_gb,
+          save_concurrent_gb=checkpoint_storage_concurrent_gb,
+          use_ocdbt=use_ocdbt,
+          use_zarr3=use_zarr3,
+      ),
   }
 
   if dataset_type is not None and dataset_type == "grain":
@@ -1032,6 +1083,7 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
     max_logging.log(f"Checkpoint for step {actual_step} already exists, skipping save.")
     return
 
+  nnx_aux_state = None
   if config.pure_nnx:
     # Save in the Linen on-disk layout so pure_nnx and Linen checkpoints are interchangeable.
     if config.enable_diloco:
@@ -1040,7 +1092,11 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
       step_value = state.step.get_value() if hasattr(state.step, "get_value") else state.step
       state = train_state_nnx.to_linen_checkpoint_dict({"model": state.params, "optimizer": {"step": step_value}})
     else:
-      state = train_state_nnx.to_linen_checkpoint_dict(state.to_pure_dict())
+      nnx_pure = state.to_pure_dict()
+      # rngs/dropout are stripped from the Linen layout; persist them separately so
+      # the RNG/dropout stream continues across resumes instead of resetting to a base key.
+      nnx_aux_state = train_state_nnx.extract_rng_state(nnx_pure.get("model", {}))
+      state = train_state_nnx.to_linen_checkpoint_dict(nnx_pure)
 
   # Determine if a checkpoint save should be forced, overriding the usual `config.checkpoint_period` logic.
   # This occurs if this function was called:
@@ -1050,7 +1106,9 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
   force_ckpt_save = step is None and actual_step != -1 and (actual_step % config.checkpoint_period != 0)
 
   try:
-    checkpoint_saved = save_checkpoint(checkpoint_manager, actual_step, state, config, data_iterator, force_ckpt_save)
+    checkpoint_saved = save_checkpoint(
+        checkpoint_manager, actual_step, state, config, data_iterator, force_ckpt_save, nnx_aux_state
+    )
     if checkpoint_saved:
       print_save_message(actual_step, config.async_checkpointing)
       if config.elastic_enabled:
@@ -1079,8 +1137,13 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
     raise exceptions.StopTraining("Job is preempted.")
 
 
-def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=None, force=False):
-  """Wrapper for saving checkpoint."""
+def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=None, force=False, nnx_aux_state=None):
+  """Wrapper for saving checkpoint.
+
+  `nnx_aux_state` holds the NNX-only rngs/dropout state stripped from the Linen
+  layout; when non-empty it's saved as a separate `nnx_aux` composite item so the
+  RNG stream survives a resume. It's ignored by emergency managers.
+  """
   if config and config.enable_checkpointing:
     if (
         force
@@ -1109,6 +1172,13 @@ def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=
       ocdbt_target_data_file_size=chunk_byte_size,
   )
   save_args_composite = {"items": checkpoint_args}
+
+  if nnx_aux_state:
+    save_args_composite["nnx_aux"] = ocp.args.PyTreeSave(
+        item=nnx_aux_state,
+        save_args=jax.tree.map(lambda _: ocp.SaveArgs(chunk_byte_size=chunk_byte_size), nnx_aux_state),
+        ocdbt_target_data_file_size=chunk_byte_size,
+    )
 
   if config and config.dataset_type == "grain" and not isinstance(data_iterator, PlaceHolderDataIterator):
     if isinstance(data_iterator, RemoteIteratorWrapper):

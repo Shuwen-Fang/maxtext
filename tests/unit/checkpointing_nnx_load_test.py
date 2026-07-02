@@ -185,5 +185,134 @@ class TestLoadParamsIntoNNX(unittest.TestCase):
     self.assertTrue(jnp.array_equal(pure["linear"]["bias"], weights["linear"]["bias"]))
 
 
+class TestExtractRngState(unittest.TestCase):
+  """train_state_nnx.extract_rng_state keeps only the NNX-only rngs/dropout subtrees."""
+
+  def test_keeps_only_rng_and_dropout(self):
+    tree = {
+        "linear": {"kernel": jnp.ones((2, 1)), "bias": jnp.zeros((1,))},
+        "rngs": {"params": {"key": jnp.asarray(1), "count": jnp.asarray(2)}},
+        "block": {"dropout": {"count": jnp.asarray(3)}, "kernel": jnp.ones((2, 2))},
+    }
+    aux = train_state_nnx.extract_rng_state(tree)
+    self.assertEqual(set(aux.keys()), {"rngs", "block"})
+    self.assertEqual(set(aux["block"].keys()), {"dropout"})  # kernel dropped
+    self.assertNotIn("linear", aux)
+
+  def test_empty_when_no_rng_state(self):
+    self.assertEqual(train_state_nnx.extract_rng_state({"linear": {"kernel": jnp.ones((2, 1))}}), {})
+
+  def test_extract_is_complement_of_strip(self):
+    """Every leaf lands in exactly one of extract / strip — nothing dropped or duplicated."""
+    tree = {
+        "linear": {"kernel": jnp.ones((2, 1))},
+        "rngs": {"params": {"count": jnp.asarray(2)}},
+    }
+    stripped = train_state_nnx._strip_rng_state(tree)  # pylint: disable=protected-access
+    extracted = train_state_nnx.extract_rng_state(tree)
+    self.assertEqual(set(stripped.keys()), {"linear"})
+    self.assertEqual(set(extracted.keys()), {"rngs"})
+
+
+class TestDeepMerge(unittest.TestCase):
+  """checkpointing._deep_merge overlays leaves onto a base dict."""
+
+  def test_overlay_wins_and_bases_survive(self):
+    base = {"model": {"linear": {"kernel": 1}, "rngs": {"count": 0}}}
+    overlay = {"model": {"rngs": {"count": 99}}}
+    merged = checkpointing._deep_merge(base, overlay)  # pylint: disable=protected-access
+    self.assertEqual(merged["model"]["linear"]["kernel"], 1)  # untouched
+    self.assertEqual(merged["model"]["rngs"]["count"], 99)  # overlaid
+
+  def test_does_not_mutate_inputs(self):
+    base = {"a": {"b": 1}}
+    checkpointing._deep_merge(base, {"a": {"c": 2}})  # pylint: disable=protected-access
+    self.assertEqual(base, {"a": {"b": 1}})
+
+  def test_non_dict_leaves_prefer_overlay(self):
+    """Leaf vs leaf: overlay wins, but a None overlay keeps the base."""
+    self.assertEqual(checkpointing._deep_merge(1, 2), 2)  # pylint: disable=protected-access
+    self.assertEqual(checkpointing._deep_merge(1, None), 1)  # pylint: disable=protected-access
+
+  def test_adds_keys_absent_from_base(self):
+    merged = checkpointing._deep_merge({"a": 1}, {"b": 2})  # pylint: disable=protected-access
+    self.assertEqual(merged, {"a": 1, "b": 2})
+
+
+class TestRngStateAuxPersistence(unittest.TestCase):
+  """rngs/dropout persisted as a separate `nnx_aux` item, restored on resume."""
+
+  def _abstract_with_dropout(self):
+    abstract = mock.Mock()
+    abstract.to_pure_dict.return_value = {
+        "model": {
+            "linear": {"kernel": jax.ShapeDtypeStruct((2, 1), jnp.float32)},
+            "dropout": {"count": jax.ShapeDtypeStruct((), jnp.uint32)},
+        },
+        "optimizer": {"step": jax.ShapeDtypeStruct((), jnp.uint32)},
+    }
+    return abstract
+
+  def _write_linen_items(self, step_dir):
+    ocp.PyTreeCheckpointer(use_ocdbt=True, use_zarr3=True).save(
+        epath.Path(step_dir) / "items",
+        {"params": {"params": {"linear": {"kernel": jnp.ones((2, 1))}}}, "step": jnp.asarray(3, jnp.int32)},
+        force=True,
+    )
+
+  def test_restores_saved_rng_state_instead_of_default(self):
+    with tempfile.TemporaryDirectory() as d:  # pylint: disable=consider-using-with
+      step_dir = os.path.join(d, "5")
+      self._write_linen_items(step_dir)
+      # Persisted rng/dropout state: count=42 (a resumed stream, not the base 0).
+      ocp.PyTreeCheckpointer(use_ocdbt=True, use_zarr3=True).save(
+          epath.Path(step_dir) / "nnx_aux",
+          {"dropout": {"count": jnp.asarray(42, jnp.uint32)}},
+          force=True,
+      )
+      restored = checkpointing._load_linen_checkpoint_into_nnx(  # pylint: disable=protected-access
+          os.path.join(step_dir, "items"), self._abstract_with_dropout(), 8, True, True
+      )
+    self.assertEqual(int(restored["model"]["dropout"]["count"]), 42)
+    self.assertTrue(jnp.array_equal(restored["model"]["linear"]["kernel"], jnp.ones((2, 1))))
+
+  def test_falls_back_to_default_when_no_aux_dir(self):
+    """A Linen-trained checkpoint (no nnx_aux) still loads; rng/dropout gets the base default."""
+    with tempfile.TemporaryDirectory() as d:  # pylint: disable=consider-using-with
+      step_dir = os.path.join(d, "5")
+      self._write_linen_items(step_dir)  # no nnx_aux written
+      restored = checkpointing._load_linen_checkpoint_into_nnx(  # pylint: disable=protected-access
+          os.path.join(step_dir, "items"), self._abstract_with_dropout(), 8, True, True
+      )
+    self.assertEqual(int(restored["model"]["dropout"]["count"]), 0)  # _default_for_sds
+
+  def test_save_checkpoint_adds_nnx_aux_item_when_present(self):
+    manager = mock.Mock()
+    manager.save.return_value = True
+    config = mock.Mock(
+        enable_checkpointing=False,
+        dataset_type="tfds",
+        lora=None,
+        checkpoint_storage_target_data_file_size_bytes=1,
+    )
+    aux = {"dropout": {"count": jnp.asarray(7, jnp.uint32)}}
+    checkpointing.save_checkpoint(manager, 5, {"params": {}}, config, None, False, aux)
+    composite = manager.save.call_args.kwargs["args"]
+    self.assertIn("nnx_aux", composite.keys())
+
+  def test_save_checkpoint_omits_nnx_aux_when_empty(self):
+    manager = mock.Mock()
+    manager.save.return_value = True
+    config = mock.Mock(
+        enable_checkpointing=False,
+        dataset_type="tfds",
+        lora=None,
+        checkpoint_storage_target_data_file_size_bytes=1,
+    )
+    checkpointing.save_checkpoint(manager, 5, {"params": {}}, config, None, False, {})
+    composite = manager.save.call_args.kwargs["args"]
+    self.assertNotIn("nnx_aux", composite.keys())
+
+
 if __name__ == "__main__":
   unittest.main()

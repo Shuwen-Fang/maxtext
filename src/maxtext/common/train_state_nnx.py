@@ -102,6 +102,26 @@ def _strip_rng_state(tree):
   return out
 
 
+def extract_rng_state(tree):
+  """Keeps only the NNX-only 'rngs'/'dropout' subtrees (complement of `_strip_rng_state`).
+
+  Returns the rngs/dropout state as a nested dict so it can be checkpointed
+  separately and restored to keep RNG continuity across resumes. Returns an empty
+  dict when the model carries no such state (e.g. dropout disabled).
+  """
+  if not isinstance(tree, dict):
+    return {}
+  out = {}
+  for k, v in tree.items():
+    if k in _NNX_RNG_STATE_KEYS:
+      out[k] = v
+    else:
+      sub = extract_rng_state(v)
+      if sub:
+        out[k] = sub
+  return out
+
+
 def _wrap_mu_nu_with_params(state):
   """Wraps mu/nu under an inner 'params' key (the Linen collection)."""
   if not isinstance(state, dict):
