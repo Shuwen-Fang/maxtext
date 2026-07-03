@@ -607,12 +607,19 @@ def apply_lora_to_model(
   )
 
   if mesh is not None:
-    from contextlib import nullcontext
     try:
       from jax._src import core as jax_core
-      mesh_ctx = jax.set_mesh(mesh) if jax_core.trace_state_clean() else nullcontext()
+      is_trace_clean = jax_core.trace_state_clean()
     except Exception:
-      mesh_ctx = nullcontext()
+      is_trace_clean = False
+
+    class _NullContext:
+      def __enter__(self):
+        return None
+      def __exit__(self, *args):
+        pass
+
+    mesh_ctx = jax.set_mesh(mesh) if is_trace_clean else _NullContext()
 
     with mesh_ctx, nn_partitioning.axis_rules(mt_config.logical_axis_rules):
       graph_def, state = nnx.split(lora_model)

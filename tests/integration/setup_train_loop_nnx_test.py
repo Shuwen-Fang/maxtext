@@ -133,6 +133,7 @@ class SetupTrainLoopNNXLoraTest(unittest.TestCase):
     # Overriding configurations to enable lora on default model
     config = _tiny_nnx_pyconfig(
         weight_dtype="bfloat16",
+        sharding_tolerance=1.0,
         lora={
             "enable_lora": True,
             "lora_rank": 4,
@@ -162,6 +163,7 @@ class SetupTrainLoopNNXLoraTest(unittest.TestCase):
     import jax.numpy as jnp
     config = _tiny_nnx_pyconfig(
         weight_dtype="bfloat16",
+        sharding_tolerance=1.0,
         lora={
             "enable_lora": True,
             "lora_rank": 4,
