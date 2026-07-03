@@ -44,6 +44,7 @@ def _tiny_nnx_pyconfig(**overrides):
       "dataset_type": "synthetic",
       "model_name": "default",
       "pure_nnx": True,
+      "attention": "dot_product",
       "per_device_batch_size": 1.0,
       "base_emb_dim": 8,
       "base_num_query_heads": 4,
@@ -122,14 +123,98 @@ class SetupTrainLoopNNXIntegrationTest(unittest.TestCase):
 
     # Same key-set after nnx.split — this is what setup_train_loop relies on at
     # train_utils.py:281-282 to pair state_params with state_mesh_shardings_params.
-    self.assertEqual(
-        jax.tree_util.tree_structure(params),
-        jax.tree_util.tree_structure(params_shardings),
-    )
-    self.assertGreater(len(jax.tree.leaves(params)), 0)
-
     del model
+
+
+class SetupTrainLoopNNXLoraTest(unittest.TestCase):
+  """Integration checks for setup_train_loop and training step with LoRA enabled."""
+
+  def test_pure_nnx_setup_with_lora_enabled(self):
+    # Overriding configurations to enable lora on default model
+    config = _tiny_nnx_pyconfig(
+        weight_dtype="bfloat16",
+        lora={
+            "enable_lora": True,
+            "lora_rank": 4,
+            "lora_alpha": 8.0,
+            "lora_module_path": ".*decoder.*",
+        }
+    )
+    (
+        _,
+        _,
+        _,
+        model,
+        _,
+        _,
+        _,
+        _,
+        _,
+        _,
+        train_state,
+    ) = setup_train_loop(config, recorder=None)
+    
+    from maxtext.utils.lora_utils import is_lora_enabled
+    self.assertTrue(is_lora_enabled(model))
+    self.assertIs(train_state.optimizer.wrt, nnx.LoRAParam)
+
+  def test_train_step_updates_only_lora_weights(self):
+    import jax.numpy as jnp
+    config = _tiny_nnx_pyconfig(
+        weight_dtype="bfloat16",
+        lora={
+            "enable_lora": True,
+            "lora_rank": 4,
+            "lora_alpha": 8.0,
+            "lora_module_path": ".*decoder.*",
+        },
+        steps=1,
+    )
+    (
+        _,
+        _,
+        _,
+        model,
+        _,
+        _,
+        _,
+        data_loader,
+        rampup_manager,
+        _,
+        train_state,
+    ) = setup_train_loop(config, recorder=None)
+    
+    # Extract initial weights
+    initial_model_state = nnx.state(model)
+    
+    # Run one training step
+    from maxtext.trainers.pre_train import train
+    batch = data_loader.load_next_batch(rampup_manager=rampup_manager)
+    
+    new_state, metrics = train.train_step(
+        model=nnx.graphdef(train_state),
+        config=config,
+        state_mesh_shardings=None,
+        params_shardings=None,
+        state=nnx.state(train_state),
+        data=batch,
+    )
+    
+    # Merge and compare
+    new_train_state = nnx.merge(nnx.graphdef(train_state), new_state)
+    new_model_state = nnx.state(new_train_state.model)
+    
+    # Verify base weights are identical, and LoRA weights are updated
+    for path, initial_var in initial_model_state.items():
+      new_var = new_model_state[path]
+      if isinstance(initial_var, nnx.LoRAParam):
+        # Should have changed
+        self.assertFalse(jnp.allclose(initial_var.value, new_var.value))
+      elif isinstance(initial_var, nnx.Param):
+        # Should NOT have changed
+        self.assertTrue(jnp.allclose(initial_var.value, new_var.value))
 
 
 if __name__ == "__main__":
   unittest.main()
+

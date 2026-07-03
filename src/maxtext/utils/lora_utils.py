@@ -607,7 +607,14 @@ def apply_lora_to_model(
   )
 
   if mesh is not None:
-    with jax.set_mesh(mesh), nn_partitioning.axis_rules(mt_config.logical_axis_rules):
+    from contextlib import nullcontext
+    try:
+      from jax._src import core as jax_core
+      mesh_ctx = jax.set_mesh(mesh) if jax_core.trace_state_clean() else nullcontext()
+    except Exception:
+      mesh_ctx = nullcontext()
+
+    with mesh_ctx, nn_partitioning.axis_rules(mt_config.logical_axis_rules):
       graph_def, state = nnx.split(lora_model)
 
       # We handle explicit replication for LoRA to ensure safety and efficiency.

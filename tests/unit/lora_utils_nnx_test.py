@@ -290,5 +290,35 @@ class TestLinenLoraRegression(unittest.TestCase):
     )
 
 
+class TestShardingExtractionNnx(unittest.TestCase):
+  """Test sharding parameter extraction under different LoRA configurations."""
+
+  def test_sharding_extracts_only_lora_params(self):
+    from maxtext.utils import sharding
+    from flax import nnx
+    class ToyModel(nnx.Module):
+      def __init__(self):
+        self.p = nnx.Param(jnp.ones((2, 2)))
+        self.lora_p = nnx.LoRAParam(jnp.zeros((2, 2)))
+    
+    class DummyConfig:
+      class DummyLora:
+        enable_lora = True
+      lora = DummyLora()
+      shard_optimizer_over_data = False
+      pure_nnx = True
+    
+    model = ToyModel()
+    graphdef, state = nnx.split(model)
+    
+    class DummyStateMeshShardings:
+      model = state
+    
+    prev_params, _ = sharding.maybe_update_params_sharding_with_opt(DummyConfig(), DummyStateMeshShardings())
+    self.assertIn("lora_p", prev_params)
+    self.assertNotIn("p", prev_params)
+
+
 if __name__ == "__main__":
   unittest.main()
+

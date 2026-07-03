@@ -36,6 +36,7 @@ from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
 from maxtext.utils import model_creation_utils
 from maxtext.utils import sharding
+from maxtext.utils import lora_utils
 from maxtext.utils.rampup_batch import create_rampup_manager
 
 
@@ -241,7 +242,11 @@ def setup_train_loop(config, recorder, devices=None):
       # For NNX, the train state is wrapped in the TrainStateNNX module.
       def create_train_state_fn():
         model = _create_model_partial()
-        optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
+        wrt = nnx.Param
+        if config.lora.enable_lora:
+          model = lora_utils.apply_lora_to_model(model, mesh, config)
+          wrt = nnx.LoRAParam
+        optimizer = nnx.Optimizer(model, tx, wrt=wrt)
         return train_state_nnx.TrainStateNNX(model, optimizer)
 
       init_state_fn = create_train_state_fn
@@ -367,6 +372,12 @@ def setup_train_loop(config, recorder, devices=None):
     else:
       train_state = nnx.merge(state_graphdef, state)
       model = train_state.model
+
+      # Restore external pre-trained LoRA adapter weights if starting a new run
+      if config.lora.enable_lora and config.lora.lora_restore_path:
+        checkpoint_step = checkpoint_manager.latest_step() if checkpoint_manager is not None else None
+        if checkpoint_step is None:
+          lora_utils.restore_lora_from_path(model, config)
   else:
     train_state = state
 
