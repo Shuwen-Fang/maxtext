@@ -25,6 +25,7 @@ import socket
 import re
 import subprocess
 import time
+from types import SimpleNamespace
 from typing import Any
 
 from packaging.version import Version
@@ -231,6 +232,37 @@ def add_text_to_summary_writer(key, value, summary_writer):
     summary_writer.add_text(key, value)
 
 
+def _single_controller_mtc_init_kwargs(raw_keys):
+  """Returns topology kwargs for single-controller MTC initialization."""
+  kwargs = {
+      "data_parallelism": raw_keys["mtc_data_parallelism"],
+      "num_slices": raw_keys["num_slices"],
+  }
+  if not raw_keys.get("elastic_enabled", False):
+    return kwargs
+
+  config = SimpleNamespace(**raw_keys)
+  if not elastic_utils.should_use_elastic(config):
+    return kwargs
+
+  active_devices = tuple(elastic_utils.live_devices(config))
+  active_slice_indices = {getattr(device, "slice_index", 0) for device in active_devices if device is not None}
+  if not active_devices or not active_slice_indices:
+    raise ValueError("Elastic single-controller MTC initialization found no active devices.")
+
+  kwargs["devices"] = active_devices
+  kwargs["num_slices"] = len(active_slice_indices)
+  if not kwargs["data_parallelism"]:
+    kwargs["data_parallelism"] = kwargs["num_slices"]
+  max_logging.log(
+      "Using active elastic devices for single-controller MTC initialization: "
+      f"active_num_slices={kwargs['num_slices']}, "
+      f"active_device_count={len(active_devices)}, "
+      f"configured_num_slices={raw_keys['num_slices']}."
+  )
+  return kwargs
+
+
 def maybe_initialize_jax_distributed_system(raw_keys):
   """The best recipe to initialize the Jax Distributed System has varied over time. We keep a layer of
   indirection in MaxText to avoid breaking the call sites unnecessarily.
@@ -248,14 +280,14 @@ def maybe_initialize_jax_distributed_system(raw_keys):
     max_logging.log("Skipping jax distributed system since its not needed for single controller.")
     if raw_keys["enable_multi_tier_checkpointing"]:
       max_logging.log("Initializing multi-tier checkpointing for single controller...")
+      mtc_init_kwargs = _single_controller_mtc_init_kwargs(raw_keys)
       initialize_multi_tier_checkpointing(
           local_checkpoint_directory=raw_keys["local_checkpoint_directory"],
           backup_interval_minutes=raw_keys["multi_tier_checkpointing_backup_interval_minutes"],
           run_name=raw_keys["run_name"],
           jax_initialization_timeout_seconds=raw_keys["jax_distributed_initialization_timeout"],
-          data_parallelism=raw_keys["mtc_data_parallelism"],
-          num_slices=raw_keys["num_slices"],
           use_colocated_python=True,
+          **mtc_init_kwargs,
       )
     return
   if jax.distributed.is_initialized():
