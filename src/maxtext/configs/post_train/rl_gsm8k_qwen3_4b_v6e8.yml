@@ -32,15 +32,15 @@ tokenizer_path: Qwen/Qwen3-4B
 tokenizer_type: huggingface
 
 # ====== Hardware ======
-# With 8 visible TPU devices, chips_per_vm=4 makes setup_configs_and_devices
-# carve a 4-device trainer mesh and a 4-device rollout mesh.
+# v6e-8 exposes 8 TPU chips on a single VM. With the current single-slice
+# device setup, this keeps trainer and rollout colocated on all 8 chips.
 trainer_devices_fraction: 0.5
 sampler_devices_fraction: 0.5
-chips_per_vm: 4
+chips_per_vm: 8
 use_pathways: true
 
-# Four one-chip vLLM replicas on the sampler half. This keeps rollout memory
-# low and gives vLLM enough data parallelism for batch_size=8, num_generations=4.
+# One one-chip vLLM replica per sampler device. In colocated v6e-8 mode this
+# resolves to 8 rollout replicas for batch_size=8, num_generations=4.
 rollout_data_parallelism: -1
 rollout_tensor_parallelism: 1
 rollout_expert_parallelism: 1
