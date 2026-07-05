@@ -69,6 +69,9 @@ class TrainStateNNX(nnx.Module):
 # NNX-only rngs/dropout state is dropped (Linen never had it).
 
 _NNX_RNG_STATE_KEYS = ("rngs", "dropout")
+# Public alias: checkpoint restore uses this to tell NNX-only rng/dropout state
+# (legitimately absent from a Linen checkpoint) apart from a genuinely missing weight.
+NNX_RNG_STATE_KEYS = _NNX_RNG_STATE_KEYS
 
 
 def _cast_step(step, dtype):
