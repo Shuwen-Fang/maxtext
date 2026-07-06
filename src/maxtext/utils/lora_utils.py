@@ -424,14 +424,20 @@ def _get_lora_module_path(mt_config: pyconfig.HyperParameters) -> str:
   model_name = mt_config.model_name.lower()
 
   # Find the first matching architecture prefix or use 'default'
-  matched_key = next((k for k in lora_configs if k != "default" and model_name.startswith(k)), "default")
+  matched_key = next(
+      (k for k in lora_configs if k != "default" and model_name.startswith(k)),
+      "default",
+  )
 
   if matched_key == "default":
     max_logging.log(f"Warning: Model '{model_name}' is unverified; falling back to default LoRA path.")
   else:
     max_logging.log(f"Auto-detected lora_module_path for model '{model_name}' (matched: '{matched_key}')")
 
-  raw_path = lora_configs.get(matched_key, "decoder/layers/.*(self_attention/(query|key|value|out)|mlp/(wi_0|wi_1|wo))")
+  raw_path = lora_configs.get(
+      matched_key,
+      "decoder/layers/.*(self_attention/(query|key|value|out)|mlp/(wi_0|wi_1|wo))",
+  )
 
   # This regex makes the layer index optional, matching both scanned and unscanned layer paths
   # (e.g. 'layers/0/mlp/...' vs 'layers/mlp/...').
@@ -612,7 +618,11 @@ def apply_lora_to_model(
 
       # We handle explicit replication for LoRA to ensure safety and efficiency.
       state = jax.tree_util.tree_map(
-          lambda x: x.replace(sharding=jax.sharding.PartitionSpec(), out_sharding=None, sharding_names=None)
+          lambda x: x.replace(
+              sharding=jax.sharding.PartitionSpec(),
+              out_sharding=None,
+              sharding_names=None,
+          )
           if isinstance(x, nnx.LoRAParam)
           else x,
           state,
@@ -624,18 +634,24 @@ def apply_lora_to_model(
       dst_shardings = nn.logical_to_mesh_sharding(nnx.get_partition_spec(state), mesh, mt_config.logical_axis_rules)
 
       def _safe_reshard(var, sharding_spec):
-        if not isinstance(var, nnx.Variable) or not isinstance(sharding_spec, jax.sharding.Sharding):
+        physical_sharding = sharding_spec.get_value() if isinstance(sharding_spec, nnx.Variable) else sharding_spec
+        if not isinstance(var, nnx.Variable) or not isinstance(physical_sharding, jax.sharding.Sharding):
           return var
         val = var.get_value()
-        if not isinstance(val, jax.Array):
+        if not isinstance(val, jax.Array) or isinstance(val, jax.core.Tracer):
           return var
         # make_array_from_callback natively constructs a globally sharded array
         # from the local host arrays, bypassing backend-specific device_put issues
         # on both Pathways and McJAX.
-        resharded_val = jax.make_array_from_callback(val.shape, sharding_spec, lambda idx: val[idx])
+        resharded_val = jax.make_array_from_callback(val.shape, physical_sharding, lambda idx: val[idx])
         return var.replace(value=resharded_val)
 
-      state = jax.tree_util.tree_map(_safe_reshard, state, dst_shardings, is_leaf=lambda x: isinstance(x, nnx.Variable))
+      state = jax.tree_util.tree_map(
+          _safe_reshard,
+          state,
+          dst_shardings,
+          is_leaf=lambda x: isinstance(x, nnx.Variable),
+      )
 
       lora_model = nnx.merge(graph_def, state)
 
@@ -677,7 +693,7 @@ def restore_lora_from_path(model: nnx.Module, mt_config: pyconfig.HyperParameter
   abstract_lora_params = nnx.state(model, nnx.LoRAParam)
 
   target_for_restore = jax.tree.map(
-      lambda v: {"value": v.value},
+      lambda v: {"value": v.get_value()},
       abstract_lora_params,
       is_leaf=lambda n: isinstance(n, nnx.Variable),
   )
@@ -698,6 +714,12 @@ def restore_lora_from_path(model: nnx.Module, mt_config: pyconfig.HyperParameter
   except Exception as e:  # pylint: disable=broad-exception-caught
     max_logging.log(f"Guided restore failed: {e}. Falling back to basic restore.")
     restored_lora_params = ocp.PyTreeCheckpointer().restore(lora_restore_path)
+
+  # If restoring from a full TrainState checkpoint, navigate into the model sub-tree
+  if isinstance(restored_lora_params, dict) and "model" in restored_lora_params:
+    restored_lora_params = restored_lora_params["model"]
+  elif hasattr(restored_lora_params, "model"):
+    restored_lora_params = getattr(restored_lora_params, "model")
 
   # Post processing
   def _map_to_state(path, variable):
@@ -722,7 +744,7 @@ def restore_lora_from_path(model: nnx.Module, mt_config: pyconfig.HyperParameter
     else:
       matched_val = curr
 
-    variable.value = matched_val
+    variable[...] = matched_val
 
   jax.tree_util.tree_map_with_path(
       _map_to_state,
@@ -839,7 +861,11 @@ def get_lora_abstract_state_nnx(base_abstract_params, lora_config):
   def get_lora_param_shape(base_array_shape, lora_module):
     if len(base_array_shape) > 4:
       raise ValueError(f"Unsupported base array shape {base_array_shape} (>4D)")
-    if lora_module in ("self_attention.query", "self_attention.key", "self_attention.value"):
+    if lora_module in (
+        "self_attention.query",
+        "self_attention.key",
+        "self_attention.value",
+    ):
       lora_a_shape = base_array_shape[:-2] + (lora_rank,)
       lora_b_shape = (lora_rank,) + base_array_shape[1:]
     elif lora_module == "self_attention.out":
@@ -858,7 +884,11 @@ def get_lora_abstract_state_nnx(base_abstract_params, lora_config):
     base_pspec = base_param_sharding.spec
     if len(base_pspec) > 4:
       raise ValueError("PartitionSpec size > 4 not supported")
-    if lora_module in ("self_attention.query", "self_attention.key", "self_attention.value"):
+    if lora_module in (
+        "self_attention.query",
+        "self_attention.key",
+        "self_attention.value",
+    ):
       lora_a_pspec = jax.sharding.PartitionSpec(*(base_pspec[:-2] + ((),)))
       lora_b_pspec = jax.sharding.PartitionSpec(*(((),) + base_pspec[1:]))
     elif lora_module == "self_attention.out":

@@ -27,13 +27,15 @@ import sys
 import unittest
 
 from flax import nnx
-import jax
+import jax.numpy as jnp
+import pytest
 from maxtext.common import train_state_nnx
 from maxtext.configs import pyconfig
+from maxtext.trainers.pre_train import train
 from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT
+from maxtext.utils.lora_utils import is_lora_enabled
 from maxtext.utils.train_utils import setup_train_loop
 from tests.utils.test_helpers import get_test_config_path
-import pytest
 
 
 def _tiny_nnx_pyconfig(**overrides):
@@ -123,6 +125,7 @@ class SetupTrainLoopNNXIntegrationTest(unittest.TestCase):
 
     # Same key-set after nnx.split — this is what setup_train_loop relies on at
     # train_utils.py:281-282 to pair state_params with state_mesh_shardings_params.
+    self.assertEqual(params.keys(), params_shardings.keys())
     del model
 
 
@@ -138,8 +141,7 @@ class SetupTrainLoopNNXLoraTest(unittest.TestCase):
             "enable_lora": True,
             "lora_rank": 4,
             "lora_alpha": 8.0,
-            "lora_module_path": ".*decoder.*",
-        }
+        },
     )
     (
         _,
@@ -154,23 +156,32 @@ class SetupTrainLoopNNXLoraTest(unittest.TestCase):
         _,
         train_state,
     ) = setup_train_loop(config, recorder=None)
-    
-    from maxtext.utils.lora_utils import is_lora_enabled
+
     self.assertTrue(is_lora_enabled(model))
     self.assertIs(train_state.optimizer.wrt, nnx.LoRAParam)
 
-  def test_train_step_updates_only_lora_weights(self):
-    import jax.numpy as jnp
+  def _run_train_step_updates_only_adapters_test(self, qlora: bool = False):
+    lora_dict = {
+        "enable_lora": True,
+        "lora_rank": 4,
+        "lora_alpha": 8.0,
+    }
+    if qlora:
+      lora_dict.update(
+          {
+              "lora_weight_qtype": "int8",
+              "lora_tile_size": 32,
+          }
+      )
+
     config = _tiny_nnx_pyconfig(
         weight_dtype="bfloat16",
         sharding_tolerance=1.0,
-        lora={
-            "enable_lora": True,
-            "lora_rank": 4,
-            "lora_alpha": 8.0,
-            "lora_module_path": ".*decoder.*",
-        },
+        base_emb_dim=32,
+        base_mlp_dim=128,
+        lora=lora_dict,
         steps=1,
+        scan_layers=False,
     )
     (
         _,
@@ -185,15 +196,14 @@ class SetupTrainLoopNNXLoraTest(unittest.TestCase):
         _,
         train_state,
     ) = setup_train_loop(config, recorder=None)
-    
+
     # Extract initial weights
     initial_model_state = nnx.state(model)
-    
+
     # Run one training step
-    from maxtext.trainers.pre_train import train
     batch = data_loader.load_next_batch(rampup_manager=rampup_manager)
-    
-    new_state, metrics = train.train_step(
+
+    new_state, _ = train.train_step(
         model=nnx.graphdef(train_state),
         config=config,
         state_mesh_shardings=None,
@@ -201,11 +211,11 @@ class SetupTrainLoopNNXLoraTest(unittest.TestCase):
         state=nnx.state(train_state),
         data=batch,
     )
-    
+
     # Merge and compare
     new_train_state = nnx.merge(nnx.graphdef(train_state), new_state)
     new_model_state = nnx.state(new_train_state.model)
-    
+
     # Verify base weights are identical, and LoRA weights are updated
     for path, initial_var in initial_model_state.items():
       new_var = new_model_state[path]
@@ -216,7 +226,14 @@ class SetupTrainLoopNNXLoraTest(unittest.TestCase):
         # Should NOT have changed
         self.assertTrue(jnp.allclose(initial_var.value, new_var.value))
 
+  def test_train_step_updates_only_lora_weights(self):
+    """Test standard LoRA updates only the adapter weights during a training step."""
+    self._run_train_step_updates_only_adapters_test(qlora=False)
+
+  def test_train_step_updates_only_qlora_weights(self):
+    """Test QLoRA updates only the adapter weights during a training step."""
+    self._run_train_step_updates_only_adapters_test(qlora=True)
+
 
 if __name__ == "__main__":
   unittest.main()
-

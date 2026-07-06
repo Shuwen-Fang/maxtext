@@ -70,6 +70,35 @@ def canonicalize_tuple(x):
     return (x,)
 
 
+def _restore_custom_types_from_state(val):
+  """Restores qwix custom quantized types from nnx.State representation."""
+  if isinstance(val, nnx.State):
+    pure_dict = {k: _restore_custom_types_from_state(v) for k, v in val.items()}
+    if "array" in pure_dict:
+      # pylint: disable=import-outside-toplevel
+      from qwix._src.providers.ptq import WithAux
+
+      return WithAux(array=pure_dict["array"], how=None)
+    elif "qvalue" in pure_dict and "scale" in pure_dict:
+      # pylint: disable=import-outside-toplevel
+      from qwix._src.core.qarray import QArray
+
+      return QArray(
+          qvalue=pure_dict["qvalue"],
+          scale=pure_dict["scale"],
+          zero_point=pure_dict.get("zero_point", None),
+          qtype=None,
+      )
+    else:
+      return pure_dict
+  elif isinstance(val, nnx.Variable):
+    return _restore_custom_types_from_state(val.get_value())
+  elif isinstance(val, dict):
+    return {k: _restore_custom_types_from_state(v) for k, v in val.items()}
+  else:
+    return val
+
+
 def _compute_dot_general(inputs, kernel, kernel_axes, axis, contract_ind, matmul_precision, quant):
   """Computes a dot_general operation that may be quantized."""
   dot_general = lax.dot_general
@@ -222,8 +251,16 @@ class DenseGeneral(nnx.Module):
     if quantizations.in_serve_mode(self.quant):
       kernel_shape = self.in_features_shape + self.out_features_shape
       kernel = jnp.zeros(kernel_shape, dtype=self.dtype)
+      restored_to_state = False
     else:
-      kernel = self.kernel[...]
+      kernel_val = self.kernel._raw_value if hasattr(self.kernel, "_raw_value") else self.kernel
+      restored_to_state = False
+      if isinstance(kernel_val, nnx.State):
+        kernel = _restore_custom_types_from_state(kernel_val)
+        self.kernel.value = kernel
+        restored_to_state = True
+      else:
+        kernel = self.kernel[...]
       # Move logit_dense kernel to device if parameter offloading is enabled
       if self.parameter_memory_host_offload:
         max_logging.log("linear.py: Moving parameter logits_dense kernel to device")
@@ -245,6 +282,9 @@ class DenseGeneral(nnx.Module):
         _initializing,
         out_sharding,
     )
+
+    if restored_to_state:
+      self.kernel.value = kernel_val
 
     if self.bias is not None:
       bias = jnp.asarray(self.bias[...], self.dtype)

@@ -78,9 +78,7 @@ VertexTensorboardManager, _vertex_tb_is_stub = vertex_tensorboard_modules()
 def get_first_step(model, state):
   if isinstance(model, nn.Module):
     return int(state.step)
-  if hasattr(
-      state, "inner_state"
-  ):  # DiLoCoTrainState (NNX DiLoCo): step is the optimizer step var
+  if hasattr(state, "inner_state"):  # DiLoCoTrainState (NNX DiLoCo): step is the optimizer step var
     return int(state.step.get_value())
   return int(state.optimizer.step.get_value())
 
@@ -393,9 +391,10 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
           is_train=True,
       )
     else:
+      wrt = nnx.LoRAParam if config.lora.enable_lora else nnx.Param
       owg_type = variablelib.variable_type_from_name("_overwrite_with_gradient", allow_register=True)
       custom_param_filter = nnx.Any(owg_type)
-      model_graphdef, curr_params, custom_params, rest = nnx.split(state.model, nnx.Param, custom_param_filter, ...)
+      model_graphdef, curr_params, custom_params, rest = nnx.split(state.model, wrt, custom_param_filter, ...)
       if config.parameter_memory_host_offload:
         # Params are kept on host (pinned_host) in in_shardings. Move only Param
         # variables to device before the forward/backward pass so that all dot_general
@@ -420,7 +419,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       def diff_wrapper(curr_params, custom_params, rest, config, data):
         local_model = nnx.merge(model_graphdef, curr_params, custom_params, rest, copy=True)
         loss, aux = loss_fn(local_model, config, data, None, None, is_train=True)
-        _, _, _, new_rest = nnx.split(local_model, nnx.Param, custom_param_filter, ...)
+        _, _, _, new_rest = nnx.split(local_model, wrt, custom_param_filter, ...)
         return loss, (aux, new_rest)
 
       grad_func = jax.value_and_grad(diff_wrapper, argnums=(0, 1), has_aux=True)
@@ -771,6 +770,17 @@ def train_loop(config, recorder, state=None):
   start_step = get_first_step(model, state)  # this is the start_step for training
   train_utils.validate_completed_steps(start_step, config.steps)
 
+  if config.pure_nnx:
+    if isinstance(state, nnx.Module):
+      _ = nnx.pop(state, nnx.Intermediate)
+    elif isinstance(state, nnx.State):
+      state = nnx.state(state, nnx.Not(nnx.Intermediate))
+
+    if isinstance(state_mesh_shardings, nnx.Module):
+      _ = nnx.pop(state_mesh_shardings, nnx.Intermediate)
+    elif isinstance(state_mesh_shardings, nnx.State):
+      state_mesh_shardings = nnx.state(state_mesh_shardings, nnx.Not(nnx.Intermediate))
+
   if isinstance(model, nn.Module):
     jit_model = model
   elif config.enable_diloco:
@@ -784,11 +794,7 @@ def train_loop(config, recorder, state=None):
     # the Zero-1 opt overlay doesn't apply through the diloco wrapper.
     params_shardings = state_mesh_shardings.params
   else:
-    params_shardings, state_mesh_shardings = (
-        sharding.maybe_update_params_sharding_with_opt(
-            config, state_mesh_shardings
-        )
-    )
+    params_shardings, state_mesh_shardings = sharding.maybe_update_params_sharding_with_opt(config, state_mesh_shardings)
 
   p_train_step, p_eval_step = train_utils.jit_train_and_eval_step(
       config,
@@ -828,9 +834,7 @@ def train_loop(config, recorder, state=None):
   if isinstance(model, nn.Module):
     setup_params = state.params
   elif config.enable_diloco:
-    setup_params = (
-        state.params
-    )  # DiLoCoTrainState.params: the outer (global) params
+    setup_params = state.params  # DiLoCoTrainState.params: the outer (global) params
   else:
     _, setup_params, _ = nnx.split(state.model, nnx.Param, ...)
   metric_logger_instance.write_setup_info_to_tensorboard(setup_params)
