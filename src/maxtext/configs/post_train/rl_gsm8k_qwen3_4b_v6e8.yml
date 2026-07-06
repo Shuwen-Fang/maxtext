@@ -61,16 +61,16 @@ rl:
 
 # ====== Training Schedule ======
 # GSM8K train yields 934 full batches at batch_size=8 (7,472 examples, with
-# drop_remainder=True). Four epochs gives 934 * 4 = 3,736 actor optimizer
-# updates, close to the Tunix non-agentic 3,738 step Llama/Gemma recipes.
+# drop_remainder=True). One epoch keeps this recipe short enough for benchmark
+# comparisons while still covering the full training split once.
 batch_size: 8
 num_batches: 934
-num_epoch: 4
+num_epoch: 1
 train_fraction: 1.0
 # Keep MaxText's generic step count and LR schedule horizon aligned with the
-# RL trainer's 934 * 4 = 3,736 optimizer updates.
-steps: 3736
-learning_rate_schedule_steps: 3736
+# RL trainer's 934 * 1 = 934 optimizer updates.
+steps: 934
+learning_rate_schedule_steps: 934
 
 # Keep activation memory predictable on the 4-device trainer mesh.
 train_micro_batch_size: 1
