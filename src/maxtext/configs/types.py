@@ -1313,6 +1313,14 @@ class MoEKernels(BaseModel):
       description="Whether to use the heuristic tiling from Tokamax GMM v2, when use_gmm_v2=true.",
   )
 
+  use_spatial_minor_tgmm: bool = Field(
+      False,
+      description=(
+          "Whether to use the spatial-minor TGMM kernel with layout constraints"
+          " for MoE backward pass (DRHS). Requires use_gmm_v2=True."
+      ),
+  )
+
 
 class DeepSeekMoE(BaseModel):
   """Configuration specific to DeepSeek-style MoE layers."""
@@ -5211,6 +5219,9 @@ class MaxTextConfig(
 
     if self.use_gmm_v2_heuristic_tiling and not self.use_gmm_v2:
       raise ValueError("`use_gmm_v2_heuristic_tiling=True` requires `use_gmm_v2=True`.")
+
+    if self.use_spatial_minor_tgmm and not self.use_gmm_v2:
+      raise ValueError("`use_spatial_minor_tgmm=True` requires `use_gmm_v2=True`.")
 
     for val in self.compress_ratios:
       if val != 0 and val < 4:

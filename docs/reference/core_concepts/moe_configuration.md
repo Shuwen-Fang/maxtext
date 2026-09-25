@@ -106,6 +106,8 @@ MaxText implements an exact, paper-aligned version of DeepSeek V4's load balanci
 
 `use_gmm_v2_heuristic_tiling`: If enabled, use the heuristic tiling from Tokamax GMM v2. Recommended when not using custom tuned tile sizes.
 
+`use_spatial_minor_tgmm`: If enabled, use the spatial-minor TGMM kernel with layout constraints for MoE backward pass (DRHS). Requires `use_gmm_v2` to be True.
+
 `megablox`: If enabled, use Megablox for sparse matrix operations. Effective only when `use_tokamax_gmm` is False.
 
 `capacity_factor`: A scalar multiplier for expert capacity. Effective only when `sparse_matmul` is False.

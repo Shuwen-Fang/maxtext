@@ -1806,6 +1806,7 @@ class RoutedMoE(nnx.Module):
         weight_gather_axes,
         group_offset,
         partial_sum=None,
+        scatter_dim=1,
     ):
       def extract_vma(tensor):
         # Extract underlying array from QArray to inspect sharding annotation string.
@@ -1896,6 +1897,8 @@ class RoutedMoE(nnx.Module):
             rhs_vma_axes=rhs_vma_axes,
             use_gmm_v2=self.config.use_gmm_v2,
             use_gmm_v2_heuristic_tiling=self.config.use_gmm_v2_heuristic_tiling,
+            use_spatial_minor_tgmm=self.config.use_spatial_minor_tgmm,
+            scatter_dim=scatter_dim,
             partial_sum=partial_sum,
             interpret=megablox_interpret,
         )
@@ -2699,6 +2702,7 @@ class RoutedMoE(nnx.Module):
           wo,
           tiling=wo_tile_size,
           weight_gather_axes=wo_gather_axes,
+          scatter_dim=2,
       )
       if self.get_tensor_parallelism_size() > 1:
         intermediate_output = jax.lax.psum_scatter(
