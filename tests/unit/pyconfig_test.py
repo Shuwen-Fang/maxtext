@@ -49,6 +49,14 @@ class PyconfigTest(unittest.TestCase):
           use_gmm_v2=False,
       )
 
+  def test_spatial_minor_tgmm_requires_gmm_v2(self):
+    with self.assertRaisesRegex(ValueError, "`use_spatial_minor_tgmm=True` requires `use_gmm_v2=True`."):
+      pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          use_spatial_minor_tgmm=True,
+          use_gmm_v2=False,
+      )
+
   def test_gdn_context_parallelism_rejects_load_balance(self):
     """The reorder composes the GatedDeltaNet recurrence out of order.
 

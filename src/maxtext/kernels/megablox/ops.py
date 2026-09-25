@@ -20,6 +20,7 @@ import dataclasses
 import functools
 from typing import List, Literal, Tuple
 import jax
+from jax.experimental import layout
 import jax.numpy as jnp
 from maxtext.kernels.megablox import backend
 from maxtext.kernels.megablox import pallas_mosaic_tpu_v2_gmm_kernel as gmm_v2
@@ -75,6 +76,8 @@ def gmm(
     use_manual_quantization: bool = False,  # used in batchsplit
     use_gmm_v2: bool = False,
     use_gmm_v2_heuristic_tiling: bool = False,
+    use_spatial_minor_tgmm: bool = False,
+    scatter_dim: int = 1,
     partial_sum: jnp.ndarray | None = None,
 ):
   """Grouped matrix multiplication operation."""
@@ -110,7 +113,7 @@ def gmm(
   gmm_fwd_bwd = lambda *args: _gmm_fwd(*args)[0]  # pylint: disable=C3001
   gmm_fwd_bwd = jax.custom_vjp(
       gmm_fwd_bwd,
-      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16),
+      nondiff_argnums=(3, 4, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18),
   )
   gmm_fwd_bwd.defvjp(_gmm_fwd, functools.partial(_gmm_bwd, lhs.dtype, rhs.dtype))
   return gmm_fwd_bwd(
@@ -131,6 +134,8 @@ def gmm(
       rhs_vma_axes,
       use_gmm_v2,
       use_gmm_v2_heuristic_tiling,
+      use_spatial_minor_tgmm,
+      scatter_dim,
       partial_sum,
   )
 
@@ -168,6 +173,8 @@ def _gmm_fwd(
     rhs_vma_axes: tuple = tuple(),
     use_gmm_v2: bool = False,
     use_gmm_v2_heuristic_tiling: bool = False,
+    use_spatial_minor_tgmm: bool = False,
+    scatter_dim: int = 1,
     partial_sum: jnp.ndarray | None = None,
 ) -> tuple[
     jnp.ndarray,
@@ -497,6 +504,8 @@ def _gmm_bwd(
     rhs_vma_axes: tuple,
     use_gmm_v2: bool,
     use_gmm_v2_heuristic_tiling: bool,
+    use_spatial_minor_tgmm: bool,
+    scatter_dim: int,
     residual: tuple[
         jnp.ndarray | qpl.QArray,
         jnp.ndarray | qpl.QArray,
@@ -585,6 +594,8 @@ def _gmm_bwd(
       rhs_vma_axes,
       quantization_rule,
       use_gmm_v2_heuristic_tiling,
+      use_spatial_minor_tgmm,
+      scatter_dim,
   )
 
   # 5. Output Formatting
@@ -882,13 +893,24 @@ def _compute_drhs(
     rhs_vma_axes: tuple,
     quantization_rule: qwix.QtRule | None,
     use_gmm_v2_heuristic_tiling: bool,
+    use_spatial_minor_tgmm: bool = False,
+    scatter_dim: int = 1,
 ) -> jnp.ndarray:
   """Routes execution of DRHS based on backend choices."""
   if use_tokamax_backend and not use_gmm_v2:
     drhs = _drhs_run_tokamax_v1(drhs_dout, lhs, group_sizes, rhs_dtype, use_manual_quantization)
   elif use_tokamax_backend and use_gmm_v2:
     drhs = _drhs_run_tokamax_v2(
-        drhs_dout, lhs, group_sizes, group_offset, num_actual_groups, rhs_dtype, tiling, use_gmm_v2_heuristic_tiling
+        drhs_dout,
+        lhs,
+        group_sizes,
+        group_offset,
+        num_actual_groups,
+        rhs_dtype,
+        tiling,
+        use_gmm_v2_heuristic_tiling,
+        use_spatial_minor_tgmm,
+        scatter_dim,
     )
   else:
     drhs = _drhs_run_megablox(
@@ -957,6 +979,8 @@ def _drhs_run_tokamax_v2(
     rhs_dtype: jax.typing.DTypeLike,
     tiling: tuple,
     use_gmm_v2_heuristic_tiling: bool,
+    use_spatial_minor_tgmm: bool = False,
+    scatter_dim: int = 1,
 ) -> jnp.ndarray:
   """Executes Tokamax TGMM V2 backend for DRHS = LHS^T @ DRHS_dout."""
   drhs_rhs = drhs_dout.qvalue if isinstance(drhs_dout, qpl.QArray) else drhs_dout
@@ -965,6 +989,45 @@ def _drhs_run_tokamax_v2(
   rhs_scale = None
   if isinstance(drhs_dout, qpl.QArray):
     rhs_scale = _drhs_prepare_bwd_scale(drhs_dout)
+
+  if use_spatial_minor_tgmm and rhs_scale is None and hasattr(tgmm_v2, "tgmm_spatial_minor_v2"):
+    if scatter_dim == 1:
+      # Up/gate projection: weight gradient has FSDP scatter dimension on axis 1.
+      # Calling tgmm_spatial_minor_v2(lhs, rhs) computes logical [G, N, K] in physical byte order {0, 1, 2}.
+      # Swap axes 1 and 2 with major_to_minor=(1, 2, 0) to yield logical [G, K, N] with physical layout {0, 2, 1},
+      # placing the scatter dimension (axis 1) as the majormost non-group dimension in memory.
+      drhs_gnk = tgmm_v2.tgmm_spatial_minor_v2(
+          lhs=drhs_lhs,
+          rhs=drhs_rhs,
+          group_sizes=group_sizes,
+          num_actual_groups=num_actual_groups,
+          group_offset=group_offset,
+          preferred_element_type=rhs_dtype,
+          out_major_to_minor=tgmm_v2.SPATIAL_MINOR_MAJOR_TO_MINOR,
+      )
+      drhs_gnk = layout.with_layout_constraint(
+          drhs_gnk, layout.Layout(major_to_minor=tgmm_v2.SPATIAL_MINOR_MAJOR_TO_MINOR)
+      )
+      drhs = jnp.swapaxes(drhs_gnk, 1, 2)
+      drhs = layout.with_layout_constraint(drhs, layout.Layout(major_to_minor=(1, 2, 0)))
+      return drhs
+    if scatter_dim == 2:
+      # Down projection: weight gradient has FSDP scatter dimension on axis 2.
+      # Calling tgmm_spatial_minor_v2(rhs, lhs) computes rhs^T @ lhs = (lhs^T @ rhs)^T.
+      # tgmm_spatial_minor_v2 writes [N, K, G] in memory and returns logical [G, K, N] directly with
+      # major_to_minor=(2, 1, 0), placing the scatter dimension (axis 2) as the majormost non-group dimension.
+      drhs = tgmm_v2.tgmm_spatial_minor_v2(
+          lhs=drhs_rhs,
+          rhs=drhs_lhs,
+          group_sizes=group_sizes,
+          num_actual_groups=num_actual_groups,
+          group_offset=group_offset,
+          preferred_element_type=rhs_dtype,
+          out_major_to_minor=tgmm_v2.SPATIAL_MINOR_MAJOR_TO_MINOR,
+      )
+      drhs = layout.with_layout_constraint(drhs, layout.Layout(major_to_minor=tgmm_v2.SPATIAL_MINOR_MAJOR_TO_MINOR))
+      return drhs
+    raise ValueError(f"Unsupported scatter_dim={scatter_dim} for spatial-minor TGMM (expected 1 or 2).")
 
   if use_gmm_v2_heuristic_tiling:
     drhs_tiling = tgmm_v2.calculate_tgmm_tiling
